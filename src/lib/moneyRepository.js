@@ -95,12 +95,7 @@ async function getRecentEntries(guildId, limit = 8) {
   return result.rows;
 }
 
-async function getRecentEntriesForDelete(guildId, memberOrUser) {
-  const isAdmin =
-    memberOrUser?.permissions?.has?.(PermissionsBitField.Flags.Administrator) || false;
-
-  const userId = memberOrUser.id;
-
+async function getRecentEntriesForDelete(guildId, userId, isAdmin = false) {
   const result = isAdmin
     ? await query(
         `
