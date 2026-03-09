@@ -8,15 +8,31 @@ const {
   EmbedBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   PermissionFlagsBits,
 } = require('discord.js');
-const { createPendingProof, clearPendingByUser, getLatestPendingProofByUser, setPendingMode, deletePendingProof } = require('../lib/pendingProofRepository');
-const { createMoneyEntry } = require('../lib/moneyRepository');
+
+const {
+  createPendingProof,
+  clearPendingByUser,
+  getLatestPendingProofByUser,
+  setPendingMode,
+  deletePendingProof,
+} = require('../lib/pendingProofRepository');
+
+const {
+  createMoneyEntry,
+  getEntryById,
+  deleteMoneyEntry,
+  getRecentEntriesForDelete,
+} = require('../lib/moneyRepository');
+
 const { refreshDashboardMessage } = require('./dashboard');
-const { sendMoneyLog } = require('./sendMoneyLog');
+const { sendMoneyLog, sendMoneyDeleteLog } = require('./sendMoneyLog');
 
 const commands = new Map();
 const commandsPath = path.join(__dirname, '..', 'commands');
+
 for (const file of fs.readdirSync(commandsPath).filter((f) => f.endsWith('.js'))) {
   const command = require(path.join(commandsPath, file));
   commands.set(command.data.name, command);
@@ -43,11 +59,11 @@ function getTodayBangkokDate() {
 function isValidDateString(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
 
-  const date = new Date(`${value}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return false;
-
   const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+
   return (
+    !Number.isNaN(date.getTime()) &&
     date.getUTCFullYear() === year &&
     date.getUTCMonth() + 1 === month &&
     date.getUTCDate() === day
@@ -99,11 +115,36 @@ function buildMoneyModal(type) {
 function buildProofFallbackButtons() {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('money:proof:upload_here').setLabel('อัปโหลดรูปในห้องนี้').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('money:proof:skip').setLabel('บันทึกโดยไม่แนบรูป').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('money:proof:cancel').setLabel('ยกเลิก').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('money:proof:upload_here')
+        .setLabel('อัปโหลดรูปในห้องนี้')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('money:proof:skip')
+        .setLabel('บันทึกโดยไม่แนบรูป')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('money:proof:cancel')
+        .setLabel('ยกเลิก')
+        .setStyle(ButtonStyle.Danger),
     ),
   ];
+}
+
+function buildDeleteOptions(entries) {
+  return entries.slice(0, 25).map((entry) => {
+    const typeLabel = entry.type === 'income' ? 'รายรับ' : 'รายจ่าย';
+    const amountText = Number(entry.amount).toLocaleString();
+    const categoryText = entry.category || '-';
+    const dateText = entry.entry_date ? String(entry.entry_date).slice(0, 10) : '-';
+    const noteText = entry.note || 'ไม่มีหมายเหตุ';
+
+    return {
+      label: `${typeLabel} | ${amountText} | ${categoryText}`.slice(0, 100),
+      description: `${dateText} | ${noteText}`.slice(0, 100),
+      value: String(entry.id),
+    };
+  });
 }
 
 async function finalizeEntry(client, pending, proofUrl) {
@@ -121,6 +162,7 @@ async function finalizeEntry(client, pending, proofUrl) {
   await deletePendingProof(pending.id);
   await refreshDashboardMessage(client, pending.guild_id).catch(console.error);
   await sendMoneyLog(client, pending.guild_id, entry).catch(console.error);
+
   return entry;
 }
 
@@ -131,7 +173,6 @@ async function handleModal(client, interaction) {
   const category = (interaction.fields.getTextInputValue('category') || '').trim();
   const note = (interaction.fields.getTextInputValue('note') || '').trim();
 
-  // จุดสำคัญ: ถ้าว่างจริง ให้กลายเป็นวันที่วันนี้ทันที
   let rawEntryDate = '';
   try {
     rawEntryDate = (interaction.fields.getTextInputValue('entry_date') || '').trim();
@@ -140,7 +181,6 @@ async function handleModal(client, interaction) {
   }
 
   const entryDate = rawEntryDate === '' ? getTodayBangkokDate() : rawEntryDate;
-
   const amount = Number(amountRaw.replace(/,/g, ''));
 
   if (!amountRaw || Number.isNaN(amount) || amount <= 0) {
@@ -155,7 +195,6 @@ async function handleModal(client, interaction) {
     });
   }
 
-  // เช็กวันที่เฉพาะตอนที่ "ผู้ใช้กรอกมาเอง"
   if (rawEntryDate !== '' && !isValidDateString(rawEntryDate)) {
     return safeReply(interaction, {
       content: 'รูปแบบวันที่ต้องเป็น YYYY-MM-DD หรือเว้นว่างไว้เพื่อใช้วันที่ปัจจุบัน',
@@ -212,6 +251,133 @@ async function handleModal(client, interaction) {
   }
 }
 
+async function handleDeleteSelect(interaction) {
+  const entryId = Number(interaction.values[0]);
+  const entry = await getEntryById(entryId);
+
+  if (!entry || entry.guild_id !== interaction.guildId) {
+    return interaction.update({
+      content: 'ไม่พบรายการนี้แล้ว',
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+  if (!isAdmin && entry.user_id !== interaction.user.id) {
+    return interaction.update({
+      content: 'คุณไม่มีสิทธิ์ลบรายการนี้',
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('ยืนยันการลบรายการ')
+    .setColor(0xff4444)
+    .setDescription('ตรวจสอบข้อมูลก่อนลบ')
+    .addFields(
+      {
+        name: 'ประเภท',
+        value: entry.type === 'income' ? 'รายรับ' : 'รายจ่าย',
+        inline: true,
+      },
+      {
+        name: 'จำนวนเงิน',
+        value: Number(entry.amount).toLocaleString(),
+        inline: true,
+      },
+      {
+        name: 'หมวดหมู่',
+        value: entry.category || '-',
+        inline: true,
+      },
+      {
+        name: 'วันที่',
+        value: entry.entry_date ? String(entry.entry_date).slice(0, 10) : '-',
+        inline: true,
+      },
+      {
+        name: 'หมายเหตุ',
+        value: entry.note || '-',
+        inline: false,
+      },
+      {
+        name: 'ผู้บันทึก',
+        value: `<@${entry.user_id}>`,
+        inline: true,
+      },
+      {
+        name: 'ID',
+        value: String(entry.id),
+        inline: true,
+      },
+    );
+
+  if (entry.proof_url) {
+    embed.addFields({
+      name: 'หลักฐาน',
+      value: entry.proof_url,
+      inline: false,
+    });
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`money:delete:confirm:${entry.id}`)
+      .setLabel('ยืนยันลบ')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId('money:delete:cancel')
+      .setLabel('ยกเลิก')
+      .setStyle(ButtonStyle.Secondary),
+  );
+
+  return interaction.update({
+    embeds: [embed],
+    components: [row],
+  });
+}
+
+async function handleDeleteConfirm(client, interaction) {
+  const entryId = Number(interaction.customId.split(':')[3]);
+  const entry = await getEntryById(entryId);
+
+  if (!entry || entry.guild_id !== interaction.guildId) {
+    return interaction.update({
+      content: 'ไม่พบรายการนี้แล้ว หรือรายการถูกลบไปแล้ว',
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+  if (!isAdmin && entry.user_id !== interaction.user.id) {
+    return safeReply(interaction, {
+      content: 'คุณไม่มีสิทธิ์ลบรายการนี้',
+    });
+  }
+
+  const deleted = await deleteMoneyEntry(entryId);
+
+  if (!deleted) {
+    return interaction.update({
+      content: 'ลบไม่สำเร็จ หรือรายการถูกลบไปแล้ว',
+      embeds: [],
+      components: [],
+    });
+  }
+
+  await refreshDashboardMessage(client, interaction.guildId).catch(console.error);
+  await sendMoneyDeleteLog(client, interaction.guildId, deleted, interaction.user).catch(console.error);
+
+  return interaction.update({
+    content: `ลบรายการ #${deleted.id} เรียบร้อยแล้ว`,
+    embeds: [],
+    components: [],
+  });
+}
+
 async function handleButton(client, interaction) {
   if (interaction.customId === 'money:add_income') {
     return interaction.showModal(buildMoneyModal('income'));
@@ -228,31 +394,90 @@ async function handleButton(client, interaction) {
 
   if (interaction.customId === 'money:proof:upload_here') {
     const pending = await getLatestPendingProofByUser(interaction.user.id);
-    if (!pending) return safeReply(interaction, { content: 'ไม่พบรายการที่รอแนบรูป' });
+    if (!pending) {
+      return safeReply(interaction, { content: 'ไม่พบรายการที่รอแนบรูป' });
+    }
+
     await setPendingMode(pending.id, 'channel');
     return safeReply(interaction, { content: 'ส่งรูปเป็นไฟล์ในห้องนี้ได้เลยภายใน 5 นาที' });
   }
 
   if (interaction.customId === 'money:proof:skip') {
     const pending = await getLatestPendingProofByUser(interaction.user.id);
-    if (!pending) return safeReply(interaction, { content: 'ไม่พบรายการที่รอดำเนินการ' });
+    if (!pending) {
+      return safeReply(interaction, { content: 'ไม่พบรายการที่รอดำเนินการ' });
+    }
+
     await finalizeEntry(client, pending, null);
     return safeReply(interaction, { content: 'บันทึกรายการเรียบร้อยแล้วโดยไม่แนบรูป' });
   }
 
   if (interaction.customId === 'money:proof:cancel') {
     const pending = await getLatestPendingProofByUser(interaction.user.id);
-    if (pending) await deletePendingProof(pending.id);
+    if (pending) {
+      await deletePendingProof(pending.id);
+    }
     return safeReply(interaction, { content: 'ยกเลิกรายการที่รออยู่แล้ว' });
   }
+
+  if (interaction.customId.startsWith('money:delete:confirm:')) {
+    return handleDeleteConfirm(client, interaction);
+  }
+
+  if (interaction.customId === 'money:delete:cancel') {
+    return interaction.update({
+      content: 'ยกเลิกการลบแล้ว',
+      embeds: [],
+      components: [],
+    });
+  }
+}
+
+async function handleSlashCommand(client, interaction) {
+  if (interaction.commandName === 'deletemoney') {
+    const entries = await getRecentEntriesForDelete(
+      interaction.guildId,
+      interaction.user.id,
+      interaction.memberPermissions?.has(PermissionFlagsBits.Administrator),
+    );
+
+    if (!entries.length) {
+      return safeReply(interaction, {
+        content: 'ไม่พบรายการที่คุณมีสิทธิ์ลบ',
+      });
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle('เลือกรายการที่ต้องการลบ')
+      .setDescription('เลือกรายการล่าสุดจากเมนูด้านล่าง')
+      .setColor(0xff9900);
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('money:delete:select')
+      .setPlaceholder('เลือกรายการที่ต้องการลบ')
+      .addOptions(buildDeleteOptions(entries));
+
+    return safeReply(interaction, {
+      embeds: [embed],
+      components: [new ActionRowBuilder().addComponents(select)],
+    });
+  }
+
+  const command = commands.get(interaction.commandName);
+  if (!command) return;
+  return command.execute(interaction, client);
 }
 
 async function handleInteractionCreate(client, interaction) {
   try {
     if (interaction.isChatInputCommand()) {
-      const command = commands.get(interaction.commandName);
-      if (!command) return;
-      return command.execute(interaction, client);
+      return handleSlashCommand(client, interaction);
+    }
+
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === 'money:delete:select') {
+        return handleDeleteSelect(interaction);
+      }
     }
 
     if (interaction.isButton()) {
@@ -264,12 +489,22 @@ async function handleInteractionCreate(client, interaction) {
     }
   } catch (error) {
     console.error('Interaction error:', error);
-    const payload = { content: `เกิดข้อผิดพลาด: ${error.message || 'unknown error'}` };
+
+    const payload = {
+      content: `เกิดข้อผิดพลาด: ${error.message || 'unknown error'}`,
+    };
+
     if (interaction.isRepliable()) {
-      if (interaction.replied || interaction.deferred) await interaction.followUp({ ...payload, ephemeral: true }).catch(() => null);
-      else await interaction.reply({ ...payload, ephemeral: true }).catch(() => null);
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp({ ...payload, ephemeral: true }).catch(() => null);
+      } else {
+        await interaction.reply({ ...payload, ephemeral: true }).catch(() => null);
+      }
     }
   }
 }
 
-module.exports = { handleInteractionCreate, finalizeEntry };
+module.exports = {
+  handleInteractionCreate,
+  finalizeEntry,
+};

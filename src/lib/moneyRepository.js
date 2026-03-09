@@ -1,3 +1,4 @@
+const { PermissionsBitField } = require('discord.js');
 const { query } = require('./db');
 
 async function upsertPanel({ guildId, channelId, messageId, createdBy }) {
@@ -94,6 +95,65 @@ async function getRecentEntries(guildId, limit = 8) {
   return result.rows;
 }
 
+async function getRecentEntriesForDelete(guildId, memberOrUser) {
+  const isAdmin =
+    memberOrUser?.permissions?.has?.(PermissionsBitField.Flags.Administrator) || false;
+
+  const userId = memberOrUser.id;
+
+  const result = isAdmin
+    ? await query(
+        `
+        SELECT id, guild_id, user_id, type, amount, category, note, entry_date, proof_url, created_at
+        FROM money_entries
+        WHERE guild_id = $1
+        ORDER BY created_at DESC
+        LIMIT 25
+        `,
+        [guildId]
+      )
+    : await query(
+        `
+        SELECT id, guild_id, user_id, type, amount, category, note, entry_date, proof_url, created_at
+        FROM money_entries
+        WHERE guild_id = $1
+          AND user_id = $2
+        ORDER BY created_at DESC
+        LIMIT 25
+        `,
+        [guildId, userId]
+      );
+
+  return result.rows;
+}
+
+async function getEntryById(id) {
+  const result = await query(
+    `
+    SELECT *
+    FROM money_entries
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [id]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function deleteMoneyEntry(id) {
+  const result = await query(
+    `
+    DELETE FROM money_entries
+    WHERE id = $1
+    RETURNING *
+    `,
+    [id]
+  );
+
+  return result.rows[0] || null;
+}
+
 module.exports = {
   upsertPanel,
   getPanelByGuild,
@@ -101,4 +161,7 @@ module.exports = {
   createMoneyEntry,
   getSummary,
   getRecentEntries,
+  getRecentEntriesForDelete,
+  getEntryById,
+  deleteMoneyEntry,
 };
